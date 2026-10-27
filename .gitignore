@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# LTspice generated files (keep only the .asc schematics)
+*.raw
+*.log
+*.net
+*.db
+*.plt
+
+# PC test build
+host_test/sim_test
