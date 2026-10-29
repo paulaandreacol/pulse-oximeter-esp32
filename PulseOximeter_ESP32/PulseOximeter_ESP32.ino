@@ -2,20 +2,21 @@
   ESP32 Pulse Oximeter - 49261 Biomedical Instrumentation, Major Project (2.6)
 
   What it does:
-    * Cycles the LEDs RED -> IR -> both off (ambient), about 1000 times a
-      second, and reads the phototransistor (VSENSE, GPIO34) in each step.
-      Switching this fast lets the op-amp filter chain (5 Hz low-pass) average
-      the switching away, so its output is a clean pulse waveform.
-    * Reads the op-amp chain output (AMPLIFIED_OUT, GPIO35).
-    * Every 20 LED cycles, averages the readings into one sample (~48 per s):
+    * Cycles the LEDs RED -> IR -> both off (ambient), 1.4 ms per step, and
+      reads the phototransistor (VSENSE, GPIO34) 0.55 ms into each step,
+      once it has settled.
+    * Reads the op-amp chain output (AMPLIFIED_OUT, GPIO35) in each step too.
+    * Every 20 ms, averages three LED cycles into one sample (50 samples/s):
         - red/IR/ambient from GPIO34 -> digital 0.5-5 Hz filters per
           wavelength -> heart rate, SpO2 (ratio of ratios), perfusion index,
           status flag (small decision tree)
         - GPIO35 -> heart rate measured from the analog (op-amp) pulse, to
           compare against the digital result
-    * Sends results over the serial port and shows them on an I2C OLED
-      (DFRobot DFR0647, SSD1306). The OLED is drawn from the ESP32's other
-      core, so its slow I2C transfers never disturb the LED timing.
+    * Shows pulse rate, SpO2 and a live pulse waveform on an I2C OLED
+      (DFRobot DFR0647, SSD1306). SpO2 is shown only when the signal passes
+      the quality checks, otherwise "--". The OLED is drawn from the ESP32's
+      other core, so its slow I2C transfers never disturb the LED timing.
+    * Sends results over the serial port.
 
   Wiring (see README.md):
     GPIO25 -> 100R -> RED LED (660 nm) -> GND   (~14 mA)
@@ -47,30 +48,30 @@ const int PIN_SCL = 22;
 
 // ----------------------------- Timing ---------------------------------------
 // One LED cycle = red phase + IR phase + dark phase, each PHASE_US long
-// (3 x 333 us = 1 ms, i.e. 1 kHz). BLOCK_CYCLES cycles are averaged into one
-// sample, then the LEDs stay off for GAP_US while the sample is processed.
-const uint32_t PHASE_US = 333;
-const uint32_t SETTLE_US = 120;   // phototransistor rise/fall time before reading
-const int READS_PER_PHASE = 1;    // GPIO34 reads per phase (plus one GPIO35 read)
-const int BLOCK_CYCLES = 20;
-const uint32_t GAP_US = 1000;
-const uint32_t BLOCK_US = 3 * PHASE_US * BLOCK_CYCLES + GAP_US;  // 20.98 ms -> 47.7 samples/s
+// (3 x 1.4 ms = 4.2 ms). BLOCK_CYCLES cycles are averaged into one sample;
+// the LEDs then stay off for the rest of the 20 ms block while the sample is
+// processed, giving exactly 50 samples per second.
+const uint32_t PHASE_US = 1400;
+const uint32_t SETTLE_US = 550;   // phototransistor rise/fall time before reading
+const int READS_PER_PHASE = 4;    // GPIO34 reads per phase (plus one GPIO35 read)
+const int BLOCK_CYCLES = 3;
+const uint32_t BLOCK_US = 20000;  // 20 ms -> 50 samples/s
 const float SAMPLE_HZ = 1e6f / BLOCK_US;
 
-// op-amp gain stage 1 + R5/R4 = 48, times the level shifter 5k/(39k + 5k)
-const float ANALOG_GAIN = 48.0f * 5.0f / 44.0f;
+const float BEAT_THRESHOLD = 0.5f;   // beat = slope sum above 50 % of recent beats
+
 const bool ANALOG_INVERT = true;   // more blood = less light = output dips -> flip
 
 // ----------------------------- Output ---------------------------------------
-// 0 = readable summary once a second
-// 1 = Arduino Serial Plotter (digital IR pulse vs analog op-amp pulse)
+// 0 = readable summary once a second (IR, RED, pulse, SpO2, status)
+// 1 = Arduino Serial Plotter (IR and red pulse waveforms)
 // 2 = CSV every sample (log to a file, then plot / calibrate in MATLAB or Python)
 #define OUTPUT_MODE 0
 
 // ----------------------------- OLED -----------------------------------------
 #define USE_OLED 1
 const int OLED_WIDTH = 128;
-const int OLED_HEIGHT = 64;      // 0.91" module = 32; use 64 for a 0.96" module
+const int OLED_HEIGHT = 64;      // 0.96" module; use 32 for a 0.91" module
 const uint8_t OLED_ADDR = 0x3C;
 
 #if USE_OLED
@@ -82,6 +83,7 @@ const uint8_t OLED_ADDR = 0x3C;
 pox::Config makeConfig() {
   pox::Config c;
   c.fs = SAMPLE_HZ;
+  c.beatThreshold = BEAT_THRESHOLD;
   // Calibration: log R (CSV mode) next to a commercial oximeter, fit SpO2 = A - B*R
   c.spo2A = 110.0f;
   c.spo2B = 25.0f;
@@ -91,13 +93,22 @@ pox::Config makeConfig() {
 pox::PulseOx oximeter(makeConfig());
 pox::BeatDetector analogBeats;  // heart rate from the op-amp chain output
 
+// SpO2 is trusted only when the reading is valid and passed the quality checks
+bool spo2Trusted(const pox::Reading& r) {
+  return r.valid && r.status != pox::Status::PoorSignal &&
+         r.status != pox::Status::Irregular;
+}
+
 #if USE_OLED
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
-// Latest results, written by loop() (core 1) and drawn by displayTask (core 0)
+// Latest results and pulse waveform, written by loop() (core 1) and drawn by
+// displayTask (core 0)
+const int WAVE_LEN = OLED_WIDTH;  // one point per pixel column: 2.56 s at 50 Hz
 struct DisplayData {
   pox::Reading r;
-  float analogBpm;
+  float wave[WAVE_LEN];
+  int waveHead;
 };
 DisplayData shown;
 portMUX_TYPE shownLock = portMUX_INITIALIZER_UNLOCKED;
@@ -105,17 +116,33 @@ portMUX_TYPE shownLock = portMUX_INITIALIZER_UNLOCKED;
 const char* friendlyStatus(pox::Status s) {
   switch (s) {
     case pox::Status::NoFinger:  return "Place finger";
-    case pox::Status::Searching: return "Measuring...";
     case pox::Status::Saturated: return "Too bright";
-    default:                     return pox::statusText(s);
+    default:                     return "Measuring...";
   }
 }
 
-// One frame takes ~15 ms over I2C, far longer than the 1 ms processing gap,
-// so the display runs as its own task on core 0, twice a second.
+// Draws the last WAVE_LEN pulse samples, auto-scaled, in the band y0..y1.
+void drawWave(const DisplayData& d, int y0, int y1) {
+  float lo = 1e9f, hi = -1e9f;
+  for (int i = 0; i < WAVE_LEN; i++) {
+    lo = fminf(lo, d.wave[i]);
+    hi = fmaxf(hi, d.wave[i]);
+  }
+  float span = (hi - lo) > 1e-3f ? (hi - lo) : 1.0f;
+  int prevY = 0;
+  for (int x = 0; x < WAVE_LEN; x++) {
+    float v = d.wave[(d.waveHead + x) % WAVE_LEN];  // oldest on the left
+    int y = y1 - (int)((v - lo) / span * (y1 - y0));
+    if (x > 0) oled.drawLine(x - 1, prevY, x, y, SSD1306_WHITE);
+    prevY = y;
+  }
+}
+
+// One frame takes ~25 ms over I2C, longer than the processing gap, so the
+// display runs as its own task on core 0, four times a second.
 void displayTask(void*) {
+  static DisplayData d;
   for (;;) {
-    DisplayData d;
     portENTER_CRITICAL(&shownLock);
     d = shown;
     portEXIT_CRITICAL(&shownLock);
@@ -123,15 +150,19 @@ void displayTask(void*) {
     oled.clearDisplay();
     oled.setTextColor(SSD1306_WHITE);
     if (d.r.valid) {
-      oled.setTextSize(2);  // big numbers: heart rate and SpO2
+      // big numbers: pulse rate and SpO2 ("--" when SpO2 is not trusted)
+      oled.setTextSize(2);
       oled.setCursor(0, 0);
-      oled.printf("%3.0f %3.0f%%", d.r.bpm, d.r.spo2);
+      oled.printf("%3.0f", d.r.bpm);
+      oled.setCursor(64, 0);
+      if (spo2Trusted(d.r)) oled.printf("%3.0f%%", d.r.spo2);
+      else oled.print(" --%");
       oled.setTextSize(1);
-      oled.setCursor(0, 16);
-      oled.printf("bpm  SpO2   PI %.1f%%", d.r.pi);
-      oled.setCursor(0, 24);
-      oled.print(pox::statusText(d.r.status));
-      if (!isnan(d.analogBpm)) oled.printf(" amp %.0f", d.analogBpm);
+      oled.setCursor(0, 17);
+      oled.print("bpm");
+      oled.setCursor(64, 17);
+      oled.print("SpO2");
+      drawWave(d, 28, OLED_HEIGHT - 1);
     } else {
       oled.setTextSize(1);
       oled.setCursor(0, 0);
@@ -141,7 +172,7 @@ void displayTask(void*) {
       oled.print(friendlyStatus(d.r.status));
     }
     oled.display();
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(250));
   }
 }
 #endif
@@ -183,14 +214,17 @@ Sample acquireBlock(uint32_t t0) {
 }
 
 void printSummary(const pox::Reading& r, float analogBpm) {
-  if (!r.valid) {
-    Serial.printf("[%s]  ir=%.0f mV  red=%.0f mV", pox::statusText(r.status),
-                  oximeter.lastIr, oximeter.lastRed);
+  Serial.printf("IR %5.0f mV | RED %5.0f mV | ", oximeter.lastIr, oximeter.lastRed);
+  if (r.valid) {
+    Serial.printf("pulse %3.0f bpm | SpO2 ", r.bpm);
+    if (spo2Trusted(r)) Serial.printf("%5.1f %%", r.spo2);
+    else Serial.print("  --- ");
+    Serial.printf(" | PI %4.2f %% | ", r.pi);
   } else {
-    Serial.printf("HR %3.0f bpm | SpO2 %5.1f %% | PI %4.2f %% | R %.3f | Q %.2f | %s",
-                  r.bpm, r.spo2, r.pi, r.ratio, r.quality, pox::statusText(r.status));
+    Serial.print("pulse --- | SpO2 --- | ");
   }
-  if (!isnan(analogBpm)) Serial.printf(" | op-amp HR %3.0f bpm", analogBpm);
+  Serial.print(pox::statusText(r.status));
+  if (!isnan(analogBpm)) Serial.printf(" | op-amp pulse %3.0f bpm", analogBpm);
   if (overruns) Serial.printf(" | WARNING %lu timing overruns: lower READS_PER_PHASE",
                               (unsigned long)overruns);
   Serial.println();
@@ -207,7 +241,7 @@ void setup() {
   analogSetPinAttenuation(PIN_SENSOR, ADC_11db);  // ~0.15-3.1 V input range
   analogSetPinAttenuation(PIN_ANALOG, ADC_11db);
 
-  analogBeats.setup(SAMPLE_HZ, 3.0f, 30.0f, 200.0f, 0.5f);
+  analogBeats.setup(SAMPLE_HZ, 3.0f, 30.0f, 200.0f, BEAT_THRESHOLD);
 
 #if USE_OLED
   Wire.begin(PIN_SDA, PIN_SCL);
@@ -221,7 +255,7 @@ void setup() {
 
   delay(500);
 #if OUTPUT_MODE == 0
-  Serial.println("ESP32 pulse oximeter - place finger in the clip");
+  Serial.println("ESP32 pulse oximeter - place finger on the sensor");
 #elif OUTPUT_MODE == 2
   Serial.println("t_ms,red_mV,ir_mV,amb_mV,analog_mV,red_ac,ir_ac,beat,bpm,spo2,pi,ratio,"
                  "quality,status,analog_bpm");
@@ -235,13 +269,13 @@ void loop() {
   static float analogDc = NAN;
 
   Sample s = acquireBlock(t0);
-  t0 += BLOCK_US;  // LEDs now off for GAP_US: process and print in this gap
+  t0 += BLOCK_US;  // LEDs now off until the next block: process and print here
 
   bool beat = oximeter.update(s.red, s.ir, s.amb);
   pox::Reading r = oximeter.reading();
 
   // Analog channel: AMPLIFIED_OUT is already band-passed by the op-amps; only
-  // the slow mean (~1.65 V) is removed here for plotting.
+  // the slow mean (~1.5 V at GPIO35) is removed here.
   if (isnan(analogDc)) analogDc = s.analog;
   analogDc += 0.02f * (s.analog - analogDc);
   float analogPulse = (ANALOG_INVERT ? -1.0f : 1.0f) * (s.analog - analogDc);
@@ -255,7 +289,9 @@ void loop() {
 
 #if USE_OLED
   portENTER_CRITICAL(&shownLock);
-  shown = {r, analogBpm};
+  shown.r = r;
+  shown.wave[shown.waveHead] = oximeter.irPulse;
+  shown.waveHead = (shown.waveHead + 1) % WAVE_LEN;
   portEXIT_CRITICAL(&shownLock);
 #endif
 
@@ -269,9 +305,8 @@ void loop() {
   (void)lastPrintMs;
   (void)r;
   (void)analogBpm;
-  // analog pulse divided by the op-amp gain so both traces are in sensor mV
-  Serial.printf("IR_digital:%.2f,OpAmp_analog:%.2f,Beat:%d\n", oximeter.irPulse,
-                analogPulse / ANALOG_GAIN, beat ? 10 : 0);
+  Serial.printf("IR:%.2f,Red:%.2f,Beat:%d\n", oximeter.irPulse, oximeter.redPulse,
+                beat ? 10 : 0);
 #else
   (void)lastPrintMs;
   Serial.printf("%lu,%.1f,%.1f,%.1f,%.1f,%.3f,%.3f,%d,%.1f,%.1f,%.2f,%.4f,%.3f,%s,%.1f\n",
@@ -280,7 +315,7 @@ void loop() {
                 pox::statusText(r.status), analogBpm);
 #endif
 
-  if ((int32_t)(micros() - t0) > 0) {  // processing ran past the gap: resync
+  if ((int32_t)(micros() - t0) > 0) {  // processing ran past the block: resync
     overruns++;
     t0 = micros() + 100;
   }
