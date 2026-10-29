@@ -41,13 +41,13 @@ GPIO25/26 ─► red + IR LEDs ─► finger ─► phototransistor (VSENSE)
 
 Each step in order:
 
-1. **LED sequencing.** Red on → IR on → both off, 333 µs each, about 1000 cycles per second. Switching this fast lets the 5 Hz analog filters smooth the switching away.
-2. **Averaging and ambient subtraction.** Every 20 cycles are averaged into one sample (≈ 47.7 samples/s). The "both off" reading is subtracted to remove room light.
+1. **LED sequencing.** Red on → IR on → both off, 1.4 ms each (one cycle = 4.2 ms). The ADC is read 0.55 ms into each step, once the phototransistor has settled.
+2. **Averaging and ambient subtraction.** Every 20 ms, three cycles are averaged into one sample (50 samples/s). The "both off" reading is subtracted to remove room light.
 3. **Digital filtering.** Each wavelength goes through 2nd-order Butterworth filters with the same corners as the analog chain (0.5 Hz high-pass, 5 Hz low-pass).
 4. **Beat detection.** A slope-sum function (Zong et al., 2003) responds to the steep rise of each pulse and ignores the dicrotic notch. Heart rate is the median of the last 8 beat intervals.
 5. **SpO₂.** Calculated from R = (AC_red/DC_red) / (AC_IR/DC_IR) as SpO₂ = A − B·R. The defaults are A = 110 and B = 25; calibrate them.
 6. **Status flag.** A small decision tree checks the signal quality first, then SpO₂ and heart-rate limits.
-7. **OLED.** Drawn on the ESP32's second core, so the slow display updates never disturb the LED timing.
+7. **OLED.** Shows pulse rate, SpO₂ ("--" when the reading fails the quality checks) and a live pulse waveform, four times a second. It is drawn on the ESP32's second core, so the slow display updates never disturb the LED timing.
 
 ## Hardware
 
@@ -110,11 +110,11 @@ The level shifter maps the op-amp's ±10.5 V swing to 0.27–2.66 V, which is sa
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `OUTPUT_MODE` | 0 | 0 = summary once a second, 1 = Serial Plotter waveforms, 2 = CSV every sample |
+| `OUTPUT_MODE` | 0 | 0 = summary once a second (IR, RED, pulse, SpO₂, status), 1 = Serial Plotter IR and red waveforms, 2 = CSV every sample |
 | `USE_OLED` | 1 | 0 builds without the display |
 | `OLED_HEIGHT` | 64 | 64 for a 0.96" module, 32 for 0.91" |
-| `READS_PER_PHASE` | 1 | ADC reads per LED phase; raise only if no "timing overruns" warning appears |
-| `ANALOG_GAIN` | 48 × 5/44 | Op-amp gain times level-shifter scale; only affects Serial Plotter scaling |
+| `READS_PER_PHASE` | 4 | ADC reads per LED phase; lower it if a "timing overruns" warning appears |
+| `BEAT_THRESHOLD` | 0.5 | A beat is counted when the slope sum rises above this fraction of recent beats |
 | `c.spo2A`, `c.spo2B` | 110, 25 | SpO₂ calibration line, in `makeConfig()` |
 
 ### Calibrating SpO₂
